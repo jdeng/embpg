@@ -211,11 +211,21 @@ func newBuilder(cfg config, cwd, outputBase string) (*builder, error) {
 		cfg.BundleDir = filepath.Join(cwd, cfg.BundleDir)
 	}
 
+	ldflagsParts := []string{fmt.Sprintf("-L%s", filepath.Join(prefixDir, "lib"))}
+	if rpathFlag != "" {
+		ldflagsParts = append(ldflagsParts, rpathFlag)
+	}
+	switch osName {
+	case "darwin":
+		ldflagsParts = append(ldflagsParts, "-lc++")
+	}
+	ldflags := strings.Join(ldflagsParts, " ")
+
 	baseEnv := map[string]string{
 		"CFLAGS":          fmt.Sprintf("-O2 -fPIC %s", platformCFlags),
 		"CXXFLAGS":        fmt.Sprintf("-O2 -fPIC %s", platformCFlags),
 		"CPPFLAGS":        fmt.Sprintf("-I%s", filepath.Join(prefixDir, "include")),
-		"LDFLAGS":         fmt.Sprintf("-L%s %s -lc++", filepath.Join(prefixDir, "lib"), rpathFlag),
+		"LDFLAGS":         ldflags,
 		"PKG_CONFIG_PATH": filepath.Join(prefixDir, "lib", "pkgconfig"),
 	}
 
@@ -248,7 +258,7 @@ func platformSettings(osName, arch string) (string, string, string, error) {
 		default:
 			opensslArch = arch
 		}
-		return fmt.Sprintf("linux-%s", opensslArch), "", "-Wl,-rpath,$ORIGIN/../lib", nil
+		return fmt.Sprintf("linux-%s", opensslArch), "", "-Wl,-rpath,\\$ORIGIN/../lib", nil
 	default:
 		return "", "", "", fmt.Errorf("unsupported OS: %s", osName)
 	}
@@ -398,19 +408,23 @@ func (b *builder) buildICU(ctx context.Context) error {
 		return err
 	}
 	return b.buildWithStamp(componentICU, func() error {
+		env := map[string]string{}
+		if b.osName == "linux" {
+			env["CXX"] = "g++"
+		}
 		if err := b.run(ctx, dir, "./configure", []string{
 			fmt.Sprintf("--prefix=%s", b.prefixDir),
 			"--enable-static",
 			"--disable-shared",
 			"--disable-samples",
 			"--disable-tests",
-		}, nil); err != nil {
+		}, env); err != nil {
 			return err
 		}
-		if err := b.run(ctx, dir, "make", []string{fmt.Sprintf("-j%d", b.cpuCount)}, nil); err != nil {
+		if err := b.run(ctx, dir, "make", []string{fmt.Sprintf("-j%d", b.cpuCount)}, env); err != nil {
 			return err
 		}
-		return b.run(ctx, dir, "make", []string{"install"}, nil)
+		return b.run(ctx, dir, "make", []string{"install"}, env)
 	})
 }
 
@@ -429,6 +443,10 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 	}
 
 	logf("Configure PostgreSQL %s", comp.Version)
+	extraEnv := map[string]string{}
+	if b.osName == "linux" {
+		extraEnv["LIBS"] = "-Wl,--no-as-needed -lstdc++ -Wl,--as-needed"
+	}
 	if err := b.run(ctx, dir, "./configure", []string{
 		fmt.Sprintf("--prefix=%s", b.pgPrefixDir),
 		fmt.Sprintf("--with-includes=%s", filepath.Join(b.prefixDir, "include")),
@@ -438,14 +456,19 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 		"--with-zlib",
 		"--with-icu",
 		"--disable-rpath",
-	}, nil); err != nil {
+	}, extraEnv); err != nil {
 		return err
+	}
+	if b.osName == "linux" {
+		if err := ensureLinuxStdlibOrder(dir); err != nil {
+			return err
+		}
 	}
 	logf("Build + install PostgreSQL")
-	if err := b.run(ctx, dir, "make", []string{fmt.Sprintf("-j%d", b.cpuCount)}, nil); err != nil {
+	if err := b.run(ctx, dir, "make", []string{fmt.Sprintf("-j%d", b.cpuCount)}, extraEnv); err != nil {
 		return err
 	}
-	return b.run(ctx, dir, "make", []string{"install"}, nil)
+	return b.run(ctx, dir, "make", []string{"install"}, extraEnv)
 }
 
 func (b *builder) packageBundle() error {
@@ -736,6 +759,31 @@ func relaxLibpqCheck(pgSourceDir string) error {
 		return nil
 	}
 	return os.WriteFile(makefile, []byte(updated), 0o644)
+}
+
+func ensureLinuxStdlibOrder(pgSourceDir string) error {
+	makefile := filepath.Join(pgSourceDir, "src", "Makefile.global")
+	data, err := os.ReadFile(makefile)
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	const suffix = " -Wl,--no-as-needed -lstdc++ -Wl,--as-needed"
+	if strings.Contains(text, suffix) {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "ICU_LIBS") {
+			if strings.Contains(line, suffix) {
+				return nil
+			}
+			lines[i] = line + suffix
+			updated := strings.Join(lines, "\n")
+			return os.WriteFile(makefile, []byte(updated), 0o644)
+		}
+	}
+	return fmt.Errorf("ICU_LIBS entry not found in %s", makefile)
 }
 
 func writeScript(path, content string) error {
