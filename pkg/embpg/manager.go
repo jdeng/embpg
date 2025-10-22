@@ -469,26 +469,45 @@ func (b *logBuffer) String() string {
 	return string(b.data)
 }
 
-func writePasswordFile(dir, password string) (string, error) {
-	file, err := os.CreateTemp(dir, "pg_pw_*")
-	if err != nil {
-		return "", fmt.Errorf("embpg: create password file: %w", err)
+func writePasswordFile(dataDir, password string) (string, error) {
+	candidates := make([]string, 0, 2)
+	if cleaned := filepath.Clean(dataDir); cleaned != "" && cleaned != "." {
+		if parent := filepath.Dir(cleaned); parent != "" && parent != "." && parent != cleaned {
+			candidates = append(candidates, parent)
+		}
 	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-		return "", fmt.Errorf("embpg: chmod password file: %w", err)
+	candidates = append(candidates, os.TempDir())
+
+	var lastErr error
+	for _, dir := range candidates {
+		file, err := os.CreateTemp(dir, "pg_pw_*")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := file.Chmod(0o600); err != nil {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+			lastErr = err
+			continue
+		}
+		if _, err := file.WriteString(password); err != nil {
+			_ = file.Close()
+			_ = os.Remove(file.Name())
+			lastErr = err
+			continue
+		}
+		if err := file.Close(); err != nil {
+			_ = os.Remove(file.Name())
+			lastErr = err
+			continue
+		}
+		return file.Name(), nil
 	}
-	if _, err := file.WriteString(password); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-		return "", fmt.Errorf("embpg: write password file: %w", err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no suitable directory for password file")
 	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(file.Name())
-		return "", fmt.Errorf("embpg: close password file: %w", err)
-	}
-	return file.Name(), nil
+	return "", fmt.Errorf("embpg: create password file: %w", lastErr)
 }
 
 func (m *Manager) ensureDatabase(ctx context.Context) error {
@@ -500,7 +519,6 @@ func (m *Manager) ensureDatabase(ctx context.Context) error {
 	}
 	createdb := filepath.Join(m.binDir, "createdb")
 	args := []string{
-		"--if-not-exists",
 		"-h", m.cfg.ListenAddress,
 		"-p", strconv.Itoa(m.cfg.Port),
 		"-U", m.cfg.Username,
@@ -511,6 +529,11 @@ func (m *Manager) ensureDatabase(ctx context.Context) error {
 		"PGPASSWORD": m.cfg.Password,
 	}
 	if err := m.runCommand(ctx, createdb, args, env); err != nil {
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "already exists") {
+			m.logf("Database %s already exists", m.cfg.Database)
+			return nil
+		}
 		return fmt.Errorf("embpg: ensure database %s: %w", m.cfg.Database, err)
 	}
 	return nil
