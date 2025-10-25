@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -56,6 +57,7 @@ type builder struct {
 	prefixDir      string
 	pgPrefixDir    string
 	bundleDir      string
+	configPath     string
 	cpuCount       int
 	osName         string
 	arch           string
@@ -82,6 +84,10 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	cfgPathValue := *cfgPath
+	if !filepath.IsAbs(cfgPathValue) {
+		cfgPathValue = filepath.Join(cwd, cfgPathValue)
+	}
 
 	if *rootOverride != "" {
 		cfg.RootDir = *rootOverride
@@ -94,7 +100,7 @@ func main() {
 	if err := validateConfig(cfg); err != nil {
 		fail(err)
 	}
-	bld, err := newBuilder(cfg, cwd, *outputDirFlag)
+	bld, err := newBuilder(cfg, cfgPathValue, cwd, *outputDirFlag)
 	if err != nil {
 		fail(err)
 	}
@@ -172,7 +178,7 @@ func validateConfig(cfg config) error {
 	return nil
 }
 
-func newBuilder(cfg config, cwd, outputBase string) (*builder, error) {
+func newBuilder(cfg config, configPath, cwd, outputBase string) (*builder, error) {
 	osName := runtime.GOOS
 	if osName != "darwin" && osName != "linux" {
 		return nil, fmt.Errorf("unsupported OS: %s", osName)
@@ -236,6 +242,7 @@ func newBuilder(cfg config, cwd, outputBase string) (*builder, error) {
 		prefixDir:      prefixDir,
 		pgPrefixDir:    pgPrefixDir,
 		bundleDir:      cfg.BundleDir,
+		configPath:     configPath,
 		cpuCount:       cpuCount,
 		osName:         osName,
 		arch:           arch,
@@ -473,33 +480,135 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 
 func (b *builder) packageBundle() error {
 	target := filepath.Join(b.bundleDir, "pgsql", "bin")
+	bundleExists := false
 	if _, err := os.Stat(target); err == nil {
 		logf("Bundle exists (%s)", b.bundleDir)
-		return nil
+		bundleExists = true
+	} else {
+		logf("Assembling bundle -> %s", b.bundleDir)
+		if err := os.MkdirAll(b.bundleDir, 0o755); err != nil {
+			return err
+		}
+		dest := filepath.Join(b.bundleDir, "pgsql")
+		if err := copyDir(b.pgPrefixDir, dest); err != nil {
+			return err
+		}
+		if err := writeScript(filepath.Join(b.bundleDir, "init-database.sh"), initDatabaseScript); err != nil {
+			return err
+		}
+		if err := writeScript(filepath.Join(b.bundleDir, "start-server.sh"), startServerScript); err != nil {
+			return err
+		}
+		if err := writeScript(filepath.Join(b.bundleDir, "stop-server.sh"), stopServerScript); err != nil {
+			return err
+		}
+		if err := writeScript(filepath.Join(b.bundleDir, "connect.sh"), connectScript); err != nil {
+			return err
+		}
 	}
-
-	logf("Assembling bundle -> %s", b.bundleDir)
-	if err := os.MkdirAll(b.bundleDir, 0o755); err != nil {
+	if err := b.writeBuildConfigReference(); err != nil {
 		return err
 	}
-	dest := filepath.Join(b.bundleDir, "pgsql")
-	if err := copyDir(b.pgPrefixDir, dest); err != nil {
+	zipPath, err := b.createBundleZip()
+	if err != nil {
 		return err
 	}
-	if err := writeScript(filepath.Join(b.bundleDir, "init-database.sh"), initDatabaseScript); err != nil {
-		return err
+	if bundleExists {
+		logf("Bundle refreshed: %s (zip: %s)", b.bundleDir, zipPath)
+	} else {
+		logf("Bundle ready: %s (zip: %s)", b.bundleDir, zipPath)
 	}
-	if err := writeScript(filepath.Join(b.bundleDir, "start-server.sh"), startServerScript); err != nil {
-		return err
-	}
-	if err := writeScript(filepath.Join(b.bundleDir, "stop-server.sh"), stopServerScript); err != nil {
-		return err
-	}
-	if err := writeScript(filepath.Join(b.bundleDir, "connect.sh"), connectScript); err != nil {
-		return err
-	}
-	logf("Bundle ready: %s", b.bundleDir)
 	return nil
+}
+
+func (b *builder) writeBuildConfigReference() error {
+	if b.configPath == "" {
+		return errors.New("build config path is not set")
+	}
+	info, err := os.Stat(b.configPath)
+	if err != nil {
+		return err
+	}
+	dest := filepath.Join(b.bundleDir, "build-config.json")
+	return copyFile(b.configPath, dest, info.Mode())
+}
+
+func (b *builder) createBundleZip() (string, error) {
+	zipPath := b.bundleDir + ".zip"
+
+	tmp, err := os.CreateTemp(filepath.Dir(zipPath), "bundle-*.zip")
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}()
+
+	zipWriter := zip.NewWriter(tmp)
+	baseDir := filepath.Dir(b.bundleDir)
+	err = filepath.WalkDir(b.bundleDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(baseDir, path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(rel)
+		header.SetMode(info.Mode())
+
+		if d.IsDir() {
+			if header.Name != "" {
+				header.Name += "/"
+				if _, err := zipWriter.CreateHeader(header); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		header.Method = zip.Deflate
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(writer, file); err != nil {
+			file.Close()
+			return err
+		}
+		return file.Close()
+	})
+	if err != nil {
+		zipWriter.Close()
+		return "", err
+	}
+	if err := zipWriter.Close(); err != nil {
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	if err := os.Rename(tmp.Name(), zipPath); err != nil {
+		return "", err
+	}
+	return zipPath, nil
 }
 
 func (b *builder) prepareComponent(name string, comp component) (string, error) {

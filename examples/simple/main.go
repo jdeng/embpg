@@ -14,6 +14,7 @@ import (
 
 func main() {
 	bundle := flag.String("bundle", defaultBundle(), "path to the postgres bundle")
+	bundleURL := flag.String("bundle-url", defaultBundleURL(), "optional zip URL that will be downloaded if the bundle directory is missing")
 	dataDir := flag.String("data", filepath.Join(os.TempDir(), "embedded-pg-data"), "data directory")
 	port := flag.Int("port", defaultPort(), "port to listen on")
 	user := flag.String("user", defaultUser(), "postgres superuser name")
@@ -21,8 +22,19 @@ func main() {
 	database := flag.String("database", "", "database to create (defaults to user)")
 	flag.Parse()
 
+	bundlePath := *bundle
+	if *bundleURL != "" {
+		setupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		resolved, err := embpg.EnsureBundle(setupCtx, *bundleURL, bundlePath)
+		cancel()
+		if err != nil {
+			log.Fatalf("ensure bundle: %v", err)
+		}
+		bundlePath = resolved
+	}
+
 	mgr, err := embpg.New(embpg.Config{
-		BundlePath:    *bundle,
+		BundlePath:    bundlePath,
 		DataDir:       *dataDir,
 		Port:          *port,
 		ListenAddress: "127.0.0.1",
@@ -62,6 +74,10 @@ func defaultBundle() string {
 		return val
 	}
 	return "dist/postgresql-darwin-arm64-16.2"
+}
+
+func defaultBundleURL() string {
+	return os.Getenv("EMBPG_BUNDLE_URL")
 }
 
 func defaultPort() int {
