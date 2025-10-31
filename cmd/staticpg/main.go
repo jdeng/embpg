@@ -450,7 +450,12 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 	}
 
 	logf("Configure PostgreSQL %s", comp.Version)
-	extraEnv := map[string]string{}
+	icuInclude := filepath.Join(b.prefixDir, "include")
+	icuLibDir := filepath.Join(b.prefixDir, "lib")
+	extraEnv := map[string]string{
+		"ICU_CFLAGS": fmt.Sprintf("-I%s", icuInclude),
+		"ICU_LIBS":   fmt.Sprintf("-L%s -licui18n -licuuc -licudata", icuLibDir),
+	}
 	if b.osName == "linux" {
 		extraEnv["LIBS"] = "-Wl,--no-as-needed -lstdc++ -Wl,--as-needed"
 	}
