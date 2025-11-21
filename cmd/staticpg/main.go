@@ -444,12 +444,6 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 	if err := relaxLibpqCheck(dir); err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(b.pgPrefixDir, "bin", "postgres")); err == nil {
-		logf("PostgreSQL already built")
-		return nil
-	}
-
-	logf("Configure PostgreSQL %s", comp.Version)
 	icuInclude := filepath.Join(b.prefixDir, "include")
 	icuLibDir := filepath.Join(b.prefixDir, "lib")
 	extraEnv := map[string]string{
@@ -459,6 +453,17 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 	if b.osName == "linux" {
 		extraEnv["LIBS"] = "-Wl,--no-as-needed -lstdc++ -Wl,--as-needed"
 	}
+	btreeGistControl := filepath.Join(b.pgPrefixDir, "share", "extension", "btree_gist.control")
+	if _, err := os.Stat(filepath.Join(b.pgPrefixDir, "bin", "postgres")); err == nil {
+		if _, extErr := os.Stat(btreeGistControl); extErr == nil {
+			logf("PostgreSQL already built")
+			return nil
+		}
+		logf("PostgreSQL already built; installing contrib extensions")
+		return b.installContrib(ctx, dir, extraEnv)
+	}
+
+	logf("Configure PostgreSQL %s", comp.Version)
 	if err := b.run(ctx, dir, "./configure", []string{
 		fmt.Sprintf("--prefix=%s", b.pgPrefixDir),
 		fmt.Sprintf("--with-includes=%s", filepath.Join(b.prefixDir, "include")),
@@ -480,17 +485,41 @@ func (b *builder) buildPostgres(ctx context.Context) error {
 	if err := b.run(ctx, dir, "make", []string{fmt.Sprintf("-j%d", b.cpuCount)}, extraEnv); err != nil {
 		return err
 	}
-	return b.run(ctx, dir, "make", []string{"install"}, extraEnv)
+	if err := b.run(ctx, dir, "make", []string{"install"}, extraEnv); err != nil {
+		return err
+	}
+	return b.installContrib(ctx, dir, extraEnv)
+}
+
+func (b *builder) installContrib(ctx context.Context, pgSourceDir string, extraEnv map[string]string) error {
+	logf("Install PostgreSQL contrib extensions")
+	args := []string{"-C", "contrib", fmt.Sprintf("-j%d", b.cpuCount), "install"}
+	return b.run(ctx, pgSourceDir, "make", args, extraEnv)
 }
 
 func (b *builder) packageBundle() error {
 	target := filepath.Join(b.bundleDir, "pgsql", "bin")
 	bundleExists := false
+	needRefresh := true
 	if _, err := os.Stat(target); err == nil {
-		logf("Bundle exists (%s)", b.bundleDir)
 		bundleExists = true
+		hasContrib, contribErr := bundleHasExtension(b.bundleDir, "btree_gist")
+		if contribErr != nil {
+			return contribErr
+		}
+		if hasContrib {
+			logf("Bundle exists (%s)", b.bundleDir)
+			needRefresh = false
+		} else {
+			logf("Bundle exists but missing contrib extensions; refreshing -> %s", b.bundleDir)
+		}
 	} else {
 		logf("Assembling bundle -> %s", b.bundleDir)
+	}
+	if needRefresh {
+		if err := os.RemoveAll(b.bundleDir); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(b.bundleDir, 0o755); err != nil {
 			return err
 		}
@@ -518,12 +547,26 @@ func (b *builder) packageBundle() error {
 	if err != nil {
 		return err
 	}
-	if bundleExists {
+	switch {
+	case bundleExists && !needRefresh:
+		logf("Bundle already up to date: %s (zip: %s)", b.bundleDir, zipPath)
+	case bundleExists:
 		logf("Bundle refreshed: %s (zip: %s)", b.bundleDir, zipPath)
-	} else {
+	default:
 		logf("Bundle ready: %s (zip: %s)", b.bundleDir, zipPath)
 	}
 	return nil
+}
+
+func bundleHasExtension(bundleDir, name string) (bool, error) {
+	control := filepath.Join(bundleDir, "pgsql", "share", "extension", fmt.Sprintf("%s.control", name))
+	if _, err := os.Stat(control); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (b *builder) writeBuildConfigReference() error {
