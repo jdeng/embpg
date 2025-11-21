@@ -7,6 +7,7 @@ This repository contains a Go replacement for `build-postgres-portable-static.sh
 - Builds static zlib, GNU Readline, OpenSSL (compiled with `OPENSSL_NO_ATEXIT`), ICU, and PostgreSQL from the specified sources while relaxing libpq's exit-symbol sanity check to allow static OpenSSL libs.
 - Writes everything into a configurable build workspace (default: `./build`) and produces a bundle under an output directory (default: `./dist/postgresql-<os>-<arch>-<version>`).
 - Downloads are checksum-verified when hashes are provided.
+- Installs PostgreSQL contrib extensions (e.g. `btree_gist`, `pg_trgm`, `pgcrypto`) into the bundle so common extensions are available out of the box.
 - Incremental: each dependency is stamped after a successful build, so re-running after a failure resumes at the first incomplete stage instead of starting over.
 - Reusable: previously downloaded archives and extracted source directories are reused automatically.
 - Bootstraps PostgreSQL clusters with configurable credentials (defaults to `postgres` / `postgres`).

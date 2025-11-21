@@ -261,6 +261,15 @@ func (m *Manager) Stop(ctx context.Context) error {
 	if err := m.runCommand(ctx, m.pgCtlPath(), args, map[string]string{}); err != nil {
 		return fmt.Errorf("embpg: pg_ctl stop: %w", err)
 	}
+	waitCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, m.cfg.StopTimeout)
+		defer cancel()
+	}
+	if err := waitForPortRelease(waitCtx, m.cfg.ListenAddress, m.cfg.Port); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -466,6 +475,21 @@ func ensurePortAvailable(address string, port int) error {
 		return fmt.Errorf("embpg: release port %d on %s: %w", port, address, err)
 	}
 	return nil
+}
+
+const portReleasePollInterval = 100 * time.Millisecond
+
+func waitForPortRelease(ctx context.Context, address string, port int) error {
+	for {
+		if err := ensurePortAvailable(address, port); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("embpg: port %d did not become available on %s: %w", port, address, ctx.Err())
+		case <-time.After(portReleasePollInterval):
+		}
+	}
 }
 
 const commandLogLimit = 64 * 1024
